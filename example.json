@@ -1,0 +1,97 @@
+[
+  {
+    "timestamp": "2026-07-16T11:42:00.000Z",
+    "latitude": 37.774929,
+    "longitude": -122.419416,
+    "accuracy": 15.3,
+    "speed": 12.5,
+    "carrier_name": "SpeedCheck SIM",
+    "network_type": "Cellular",
+    "technology": "5G SA",
+    "mcc": "404",
+    "mnc": "45",
+    "data_state": "Connected",
+    "registered_state": "serving",
+    "imei": "862947104928374",
+    
+    "ss_rsrp": -88,
+    "ss_rsrq": -11,
+    "ss_sinr": 18,
+    "csi_rsrp": -91,
+    "csi_rsrq": -12,
+    "csi_sinr": 15,
+    "nci": "38274910",
+    "pci_5g": 312,
+    "tac_5g": 14205,
+    "nrarfcn": 632000,
+    "nr_band": "n78",
+    "nr_bandwidth": null,
+    "nr_bwp": null,
+    "asu_5g": 52,
+    "nr_cqi": 9,
+    "nr_cqi_table_index": 1,
+    
+    "rsrp_4g": null,
+    "rsrq_4g": null,
+    "rssi_4g": null,
+    "rssnr_4g": null,
+    "lte_cqi": null,
+    "timing_advance": null,
+    "ci_4g": null,
+    "pci_4g": null,
+    "tac_4g": null,
+    "earfcn_4g": null,
+    "lte_band": null,
+    "lte_bandwidth": null,
+    "asu_4g": null,
+    "calculated_distance": null,
+    
+    "rscp_3g": null,
+    "ec_no_3g": null,
+    "lac_3g": null,
+    "ucid_3g": null,
+    "psc_3g": null,
+    "uarfcn_3g": null,
+    "asu_3g": null,
+    
+    "rssi_2g": null,
+    "rx_qual_2g": null,
+    "lac_2g": null,
+    "cid_2g": null,
+    "bsic_2g": null,
+    "arfcn_2g": null,
+    "asu_2g": null,
+    
+    "neighbor_cells": [
+      {
+        "tech": "5G",
+        "pci": 313,
+        "rsrp": -93,
+        "rsrq": -13,
+        "earfcn": 632050
+      },
+      {
+        "tech": "5G",
+        "pci": 314,
+        "rsrp": -99,
+        "rsrq": -15,
+        "earfcn": 632100
+      }
+    ],
+    
+    "ppi": 2,
+    "ppi_state": "Clean",
+    "dominance_margin": 5.0,
+    "ping_pong_index": 0,
+    "rf_asymmetry_index": null,
+    
+    "download_speed": 124.5,
+    "upload_speed": 34.2,
+    "ping": 22.0,
+    "jitter": 2.5,
+    "packet_loss": 0.0,
+    
+    "device_model": "OnePlus CPH2613",
+    "android_version": "Android 14"
+  }
+]
