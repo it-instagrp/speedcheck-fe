@@ -21,7 +21,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
@@ -104,12 +104,25 @@ class DatabaseHelper {
         synced INTEGER NOT NULL DEFAULT 0
       )
     ''');
+    await db.execute('''
+      CREATE TABLE settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )
+    ''');
   }
 
   Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 3) {
       await db.execute('DROP TABLE IF EXISTS speedcheck_logs');
       await _createDB(db, newVersion);
+    } else if (oldVersion < 4) {
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      ''');
     }
   }
 
@@ -177,6 +190,55 @@ class DatabaseHelper {
   Future<int> clearAllLogs() async {
     final db = await instance.database;
     return await db.delete('speedcheck_logs');
+  }
+
+  // Get a setting value, returning a default if not found
+  Future<String> getSetting(String key, String defaultValue) async {
+    try {
+      final db = await instance.database;
+      final maps = await db.query(
+        'settings',
+        columns: ['value'],
+        where: 'key = ?',
+        whereArgs: [key],
+      );
+      if (maps.isNotEmpty) {
+        return maps.first['value'] as String;
+      }
+    } catch (e) {
+      print('Error getting setting $key: $e');
+    }
+    return defaultValue;
+  }
+
+  // Set a setting value
+  Future<void> setSetting(String key, String value) async {
+    try {
+      final db = await instance.database;
+      await db.insert(
+        'settings',
+        {'key': key, 'value': value},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    } catch (e) {
+      print('Error setting $key: $e');
+    }
+  }
+
+  // Purge logs older than X days
+  Future<int> purgeLogsOlderThan(int days) async {
+    try {
+      final db = await instance.database;
+      final cutoff = DateTime.now().subtract(Duration(days: days)).toIso8601String();
+      return await db.delete(
+        'speedcheck_logs',
+        where: 'timestamp < ?',
+        whereArgs: [cutoff],
+      );
+    } catch (e) {
+      print('Error purging logs: $e');
+      return 0;
+    }
   }
 
   Future<void> close() async {

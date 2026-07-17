@@ -155,6 +155,53 @@ double? calculateRfAsymmetry(int? rsrp, int? rssi) {
 }
 
 @pragma('vm:entry-point')
+Future<void> saveFileLog(TelemetryModel telemetry) async {
+  try {
+    final db = DatabaseHelper.instance;
+    final format = await db.getSetting('log_storage_format', 'SQLite');
+    
+    if (format == 'JSON' || format == 'CSV') {
+      final naming = await db.getSetting('log_naming_convention', 'speedcheck_log_TIMESTAMP');
+      final location = await db.getSetting('log_storage_location', 'Documents/SpeedCheck/Logs');
+      
+      final appDocDir = await getApplicationDocumentsDirectory();
+      String subPath = location.replaceAll('/Internal Storage/', '').replaceAll('Internal Storage/', '');
+      final targetDir = Directory(p.join(appDocDir.path, subPath));
+      if (!await targetDir.exists()) {
+        await targetDir.create(recursive: true);
+      }
+      
+      final now = DateTime.now();
+      final formattedTime = '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}_'
+          '${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}${now.second.toString().padLeft(2, '0')}';
+      
+      String fileName = naming.replaceAll('TIMESTAMP', formattedTime);
+      if (format == 'JSON') {
+        fileName = '$fileName.json';
+        final file = File(p.join(targetDir.path, fileName));
+        await file.writeAsString(jsonEncode(telemetry.toJson()));
+      } else if (format == 'CSV') {
+        fileName = '$fileName.csv';
+        final file = File(p.join(targetDir.path, fileName));
+        final jsonMap = telemetry.toJson();
+        final headers = jsonMap.keys.join(',');
+        final values = jsonMap.values.map((v) {
+          if (v == null) return '';
+          final valStr = v.toString();
+          if (valStr.contains(',') || valStr.contains('\n') || valStr.contains('"')) {
+            return '"${valStr.replaceAll('"', '""')}"';
+          }
+          return valStr;
+        }).join(',');
+        await file.writeAsString('$headers\n$values');
+      }
+    }
+  } catch (e) {
+    print('saveFileLog error: $e');
+  }
+}
+
+@pragma('vm:entry-point')
 void onStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
 
@@ -176,352 +223,380 @@ void onStart(ServiceInstance service) async {
   final DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
   String model = 'Unknown';
   String osVersion = 'Unknown';
-  bool isPhysicalDevice = true;
   try {
     if (Platform.isAndroid) {
       final androidInfo = await deviceInfo.androidInfo;
       model = '${androidInfo.brand} ${androidInfo.model}';
       osVersion = 'Android ${androidInfo.version.release}';
-      isPhysicalDevice = androidInfo.isPhysicalDevice;
     } else if (Platform.isIOS) {
       final iosInfo = await deviceInfo.iosInfo;
       model = iosInfo.utsname.machine;
       osVersion = 'iOS ${iosInfo.systemVersion}';
-      isPhysicalDevice = iosInfo.isPhysicalDevice;
     }
   } catch (e) {
     print('Failed to get device info: $e');
   }
 
-  Timer.periodic(const Duration(seconds: COLLECTION_FREQUENCY_SECONDS), (
-    timer,
-  ) async {
-    try {
-      // 1. Connectivity Type
-      final connectivityResult = await Connectivity().checkConnectivity();
-      String networkTypeStr = 'None';
-      if (connectivityResult.contains(ConnectivityResult.wifi)) {
-        networkTypeStr = 'WiFi';
-      } else if (connectivityResult.contains(ConnectivityResult.mobile)) {
-        networkTypeStr = 'Cellular';
-      }
+  Timer? collectTimer;
+  final dbHelper = DatabaseHelper.instance;
 
-      // Run Active Speed Diagnostics if connected to a valid network
-      SpeedTestResult? speedResult;
-      if (networkTypeStr != 'None') {
-        try {
-          speedResult = await SpeedTestHelper.runTest(useSimulation: false);
-        } catch (e) {
-          print('Speed test execution error: $e');
-        }
-      }
-
-      // 2. GPS Positioning Fallbacks
-      double? lat;
-      double? lng;
-      double? accuracy;
-      double? gpsSpeed;
+  void startTimer(int seconds) {
+    collectTimer?.cancel();
+    collectTimer = Timer.periodic(Duration(seconds: seconds), (timer) async {
       try {
-        Position? position;
-        try {
-          position = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-            timeLimit: const Duration(seconds: 4),
-          );
-        } catch (_) {
-          position = await Geolocator.getLastKnownPosition();
+        // 1. Connectivity Type
+        final connectivityResult = await Connectivity().checkConnectivity();
+        String networkTypeStr = 'None';
+        if (connectivityResult.contains(ConnectivityResult.wifi)) {
+          networkTypeStr = 'WiFi';
+        } else if (connectivityResult.contains(ConnectivityResult.mobile)) {
+          networkTypeStr = 'Cellular';
         }
 
-        if (position != null) {
-          lat = position.latitude;
-          lng = position.longitude;
-          accuracy = position.accuracy;
-          gpsSpeed = position.speed;
+        // Run Active Speed Diagnostics if connected to a valid network
+        SpeedTestResult? speedResult;
+        if (networkTypeStr != 'None') {
+          try {
+            speedResult = await SpeedTestHelper.runTest(useSimulation: false);
+          } catch (e) {
+            print('Speed test execution error: $e');
+          }
+        }
+
+        // 2. GPS Positioning Fallbacks
+        double? lat;
+        double? lng;
+        double? accuracy;
+        double? gpsSpeed;
+        try {
+          Position? position;
+          try {
+            position = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.high,
+              timeLimit: const Duration(seconds: 4),
+            );
+          } catch (_) {
+            position = await Geolocator.getLastKnownPosition();
+          }
+
+          if (position != null) {
+            lat = position.latitude;
+            lng = position.longitude;
+            accuracy = position.accuracy;
+            gpsSpeed = position.speed;
+          }
+        } catch (e) {
+          print('GPS acquisition error: $e');
+        }
+
+        // 3. Telemetry Channel Pull
+        Map<dynamic, dynamic>? nativeCellInfo;
+
+        if (Platform.isAndroid) {
+          try {
+            final result = await cellChannel.invokeMethod('getCellInfo');
+            if (result is Map) {
+              nativeCellInfo = result;
+            }
+          } catch (e) {
+            print('MethodChannel telephony error: $e');
+          }
+        }
+
+        final String? carrier = nativeCellInfo?['carrierName'] as String?;
+        final String? tech = nativeCellInfo?['technology'] as String?;
+        final String? mcc = nativeCellInfo?['mcc'] as String?;
+        final String? mnc = nativeCellInfo?['mnc'] as String?;
+        final String? dataState = nativeCellInfo?['dataState'] as String?;
+        final String? regState = nativeCellInfo?['registeredState'] as String?;
+        final String? imei = nativeCellInfo?['imei'] as String?;
+
+        // Parse Neighbors
+        List<Map<String, dynamic>> neighbors = [];
+        if (nativeCellInfo?['neighbors'] is List) {
+          final List rawList = nativeCellInfo?['neighbors'] as List;
+          neighbors = rawList
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
+        }
+
+        // Extract specific technology configurations
+        int? ssRsrp,
+            ssRsrq,
+            ssSinr,
+            csiRsrp,
+            csiRsrq,
+            csiSinr,
+            pci5g,
+            tac5g,
+            nrarfcn,
+            nrBandwidth,
+            nrBwp,
+            asu5g,
+            nrCqi,
+            nrCqiTableIndex;
+        String? nci, nrBand;
+
+        int? rsrp4g,
+            rsrq4g,
+            rssi4g,
+            rssnr4g,
+            lteCqi,
+            timingAdvance,
+            ci4g,
+            pci4g,
+            tac4g,
+            earfcn4g,
+            lteBandwidth,
+            asu4g;
+        String? lteBand;
+
+        int? rscp3g, ecNo3g, lac3g, ucid3g, psc3g, uarfcn3g, asu3g;
+        int? rssi2g, rxQual2g, lac2g, cid2g, bsic2g, arfcn2g, asu2g;
+
+        String? activeCellId;
+        int? activeRsrp;
+
+        if (tech != null) {
+          if (tech.contains('5G')) {
+            activeCellId = nativeCellInfo?['nci']?.toString();
+            nci = activeCellId;
+            pci5g = nativeCellInfo?['pci'] as int?;
+            tac5g = nativeCellInfo?['tac'] as int?;
+            nrarfcn = nativeCellInfo?['nrarfcn'] as int?;
+
+            final bandsList = nativeCellInfo?['bands'] as List?;
+            nrBand = getNrBand(nrarfcn, bandsList);
+            nrBandwidth = nativeCellInfo?['nrBandwidth'] as int?;
+            nrBwp = nativeCellInfo?['nrBwp'] as int?;
+
+            ssRsrp = nativeCellInfo?['ssRsrp'] as int?;
+            ssRsrq = nativeCellInfo?['ssRsrq'] as int?;
+            ssSinr = nativeCellInfo?['ssSinr'] as int?;
+            csiRsrp = nativeCellInfo?['csiRsrp'] as int?;
+            csiRsrq = nativeCellInfo?['csiRsrq'] as int?;
+            csiSinr = nativeCellInfo?['csiSinr'] as int?;
+            asu5g = nativeCellInfo?['asuLevel'] as int?;
+            activeRsrp = ssRsrp ?? csiRsrp;
+
+            final cqiList = nativeCellInfo?['cqiReport'] as List?;
+            if (cqiList != null && cqiList.isNotEmpty) {
+              nrCqi = cqiList.first as int?;
+            }
+            nrCqiTableIndex = nativeCellInfo?['cqiTableIndex'] as int?;
+          } else if (tech == '4G') {
+            activeCellId = nativeCellInfo?['ci']?.toString();
+            ci4g = nativeCellInfo?['ci'] as int?;
+            pci4g = nativeCellInfo?['pci'] as int?;
+            tac4g = nativeCellInfo?['tac'] as int?;
+            earfcn4g = nativeCellInfo?['earfcn'] as int?;
+            lteBand = getLteBand(earfcn4g);
+
+            final rawBw = nativeCellInfo?['bandwidth'] as int?;
+            lteBandwidth = rawBw != null ? (rawBw / 1000).round() : null;
+
+            rsrp4g = nativeCellInfo?['rsrp'] as int?;
+            rsrq4g = nativeCellInfo?['rsrq'] as int?;
+            rssi4g = nativeCellInfo?['rssi'] as int?;
+            rssnr4g = nativeCellInfo?['rssnr'] as int?;
+            asu4g = nativeCellInfo?['asuLevel'] as int?;
+            timingAdvance = nativeCellInfo?['timingAdvance'] as int?;
+            lteCqi = nativeCellInfo?['cqi'] as int?;
+            activeRsrp = rsrp4g;
+            activeCellId ??= ci4g?.toString();
+          } else if (tech == '3G') {
+            activeCellId =
+                nativeCellInfo?['ucid']?.toString() ??
+                nativeCellInfo?['cellId']?.toString();
+            ucid3g = nativeCellInfo?['ucid'] as int?;
+            psc3g = nativeCellInfo?['psc'] as int?;
+            lac3g = nativeCellInfo?['lac'] as int?;
+            uarfcn3g = nativeCellInfo?['uarfcn'] as int?;
+
+            rscp3g = nativeCellInfo?['rscp'] as int?;
+            ecNo3g = nativeCellInfo?['ecNo'] as int?;
+            asu3g = nativeCellInfo?['asuLevel'] as int?;
+            activeRsrp = rscp3g;
+            activeCellId ??= ucid3g?.toString();
+          } else if (tech == '2G') {
+            activeCellId =
+                nativeCellInfo?['cid']?.toString() ??
+                nativeCellInfo?['cellId']?.toString();
+            cid2g = nativeCellInfo?['cid'] as int?;
+            bsic2g = nativeCellInfo?['bsic'] as int?;
+            lac2g = nativeCellInfo?['lac'] as int?;
+            arfcn2g = nativeCellInfo?['arfcn'] as int?;
+
+            rssi2g = nativeCellInfo?['rssi'] as int?;
+            final ber = nativeCellInfo?['bitErrorRate'] as int?;
+            rxQual2g = ber;
+            asu2g = nativeCellInfo?['asuLevel'] as int?;
+            activeRsrp = rssi2g;
+            activeCellId ??= cid2g?.toString();
+          }
+        }
+
+        // 4. Calculate Derived KPIs
+        final double? dist = calculateDistance(timingAdvance);
+        final double? domMargin = calculateDominanceMargin(
+          activeRsrp,
+          neighbors,
+          tech,
+        );
+        final int ppiVal = calculatePpi(activeRsrp, neighbors, tech);
+        final String ppiStateStr = ppiVal >= 4 ? 'Polluted' : 'Clean';
+        final int pingPong = await calculatePingPongIndex(activeCellId);
+
+        double? asymmetry;
+        if (tech == '4G') {
+          asymmetry = calculateRfAsymmetry(rsrp4g, rssi4g);
+        }
+
+        // 6. Build Model using active runtime performance statistics
+        final telemetry = TelemetryModel(
+          timestamp: DateTime.now().toIso8601String(),
+          latitude: lat,
+          longitude: lng,
+          accuracy: accuracy,
+          speed: gpsSpeed,
+          carrierName: carrier,
+          networkType: networkTypeStr,
+          technology: tech,
+          mcc: mcc,
+          mnc: mnc,
+          dataState: dataState,
+          registeredState: regState,
+          imei: imei,
+
+          // 5G NR
+          ssRsrp: ssRsrp,
+          ssRsrq: ssRsrq,
+          ssSinr: ssSinr,
+          csiRsrp: csiRsrp,
+          csiRsrq: csiRsrq,
+          csiSinr: csiSinr,
+          nci: nci,
+          pci5g: pci5g,
+          tac5g: tac5g,
+          nrarfcn: nrarfcn,
+          nrBand: nrBand,
+          nrBandwidth: nrBandwidth,
+          nrBwp: nrBwp,
+          asu5g: asu5g,
+          nrCqi: nrCqi,
+          nrCqiTableIndex: nrCqiTableIndex,
+
+          // 4G LTE
+          rsrp4g: rsrp4g,
+          rsrq4g: rsrq4g,
+          rssi4g: rssi4g,
+          rssnr4g: rssnr4g,
+          lteCqi: lteCqi,
+          timingAdvance: timingAdvance,
+          ci4g: ci4g,
+          pci4g: pci4g,
+          tac4g: tac4g,
+          earfcn4g: earfcn4g,
+          lteBand: lteBand,
+          lteBandwidth: lteBandwidth,
+          asu4g: asu4g,
+          calculatedDistance: dist,
+
+          // 3G WCDMA
+          rscp3g: rscp3g,
+          ecNo3g: ecNo3g,
+          lac3g: lac3g,
+          ucid3g: ucid3g,
+          psc3g: psc3g,
+          uarfcn3g: uarfcn3g,
+          asu3g: asu3g,
+
+          // 2G GSM
+          rssi2g: rssi2g,
+          rxQual2g: rxQual2g,
+          lac2g: lac2g,
+          cid2g: cid2g,
+          bsic2g: bsic2g,
+          arfcn2g: arfcn2g,
+          asu2g: asu2g,
+
+          neighborCells: neighbors,
+          ppi: ppiVal,
+          ppiState: ppiStateStr,
+          dominanceMargin: domMargin,
+          pingPongIndex: pingPong,
+          rfAsymmetryIndex: asymmetry,
+
+          // Populated KPIs matching schema constraints
+          downloadSpeed: speedResult?.downloadSpeed,
+          uploadSpeed: speedResult?.uploadSpeed,
+          ping: speedResult?.ping,
+          jitter: speedResult?.jitter,
+          packetLoss: speedResult?.packetLoss,
+          deviceModel: model,
+          androidVersion: osVersion,
+          synced: false,
+        );
+
+        // Save database log
+        final insertedId = await DatabaseHelper.instance.insertLog(telemetry);
+
+        // Save to file if custom format is active
+        await saveFileLog(telemetry);
+
+        // Auto Purge logs if enabled
+        final autoPurgeStr = await dbHelper.getSetting('auto_purge_logs', 'true');
+        if (autoPurgeStr == 'true') {
+          await dbHelper.purgeLogsOlderThan(30);
+        }
+
+        // Auto Sync if connected
+        bool syncSuccessful = false;
+        if (networkTypeStr != 'None') {
+          final syncOnlyWifi = await dbHelper.getSetting('sync_only_wifi', 'false') == 'true';
+          if (!syncOnlyWifi || networkTypeStr == 'WiFi') {
+            syncSuccessful = await performSync();
+          }
+        }
+
+        final unsyncedCount = await DatabaseHelper.instance.getUnsyncedCount();
+
+        // Emit parameters map to dashboard isolate
+        final Map<String, dynamic> updateData = telemetry.toDbMap();
+        updateData['id'] = insertedId;
+        updateData['unsynced_count'] = unsyncedCount;
+        updateData['sync_success'] = syncSuccessful;
+
+        service.invoke('update', updateData);
+
+        // Update Foreground persistent notification info
+        if (service is AndroidServiceInstance) {
+          String networkSummary = networkTypeStr == 'Cellular'
+              ? '$tech ($carrier)'
+              : networkTypeStr;
+          service.setForegroundNotificationInfo(
+            title: 'SpeedCheck Telemetry Active',
+            content: 'Net: $networkSummary | Unsynced: $unsyncedCount',
+          );
         }
       } catch (e) {
-        print('GPS acquisition error: $e');
+        print('Background collect loop error: $e');
       }
+    });
+  }
 
-      // 3. Telemetry Channel Pull
-      Map<dynamic, dynamic>? nativeCellInfo;
+  // Load initial settings and start the periodic timer
+  final initialFreqStr = await dbHelper.getSetting('record_frequency', '10');
+  int freqSeconds = int.tryParse(initialFreqStr) ?? 10;
+  startTimer(freqSeconds);
 
-      if (Platform.isAndroid) {
-        try {
-          final result = await cellChannel.invokeMethod('getCellInfo');
-          if (result is Map) {
-            nativeCellInfo = result;
-          }
-        } catch (e) {
-          print('MethodChannel telephony error: $e');
-        }
-      }
-
-      final String? carrier = nativeCellInfo?['carrierName'] as String?;
-      final String? tech = nativeCellInfo?['technology'] as String?;
-      final String? mcc = nativeCellInfo?['mcc'] as String?;
-      final String? mnc = nativeCellInfo?['mnc'] as String?;
-      final String? dataState = nativeCellInfo?['dataState'] as String?;
-      final String? regState = nativeCellInfo?['registeredState'] as String?;
-      final String? imei = nativeCellInfo?['imei'] as String?;
-
-      // Parse Neighbors
-      List<Map<String, dynamic>> neighbors = [];
-      if (nativeCellInfo?['neighbors'] is List) {
-        final List rawList = nativeCellInfo?['neighbors'] as List;
-        neighbors = rawList
-            .map((e) => Map<String, dynamic>.from(e as Map))
-            .toList();
-      }
-
-      // Extract specific technology configurations
-      int? ssRsrp,
-          ssRsrq,
-          ssSinr,
-          csiRsrp,
-          csiRsrq,
-          csiSinr,
-          pci5g,
-          tac5g,
-          nrarfcn,
-          nrBandwidth,
-          nrBwp,
-          asu5g,
-          nrCqi,
-          nrCqiTableIndex;
-      String? nci, nrBand;
-
-      int? rsrp4g,
-          rsrq4g,
-          rssi4g,
-          rssnr4g,
-          lteCqi,
-          timingAdvance,
-          ci4g,
-          pci4g,
-          tac4g,
-          earfcn4g,
-          lteBandwidth,
-          asu4g;
-      String? lteBand;
-
-      int? rscp3g, ecNo3g, lac3g, ucid3g, psc3g, uarfcn3g, asu3g;
-      int? rssi2g, rxQual2g, lac2g, cid2g, bsic2g, arfcn2g, asu2g;
-
-      String? activeCellId;
-      int? activeRsrp;
-
-      if (tech != null) {
-        if (tech.contains('5G')) {
-          activeCellId = nativeCellInfo?['nci']?.toString();
-          nci = activeCellId;
-          pci5g = nativeCellInfo?['pci'] as int?;
-          tac5g = nativeCellInfo?['tac'] as int?;
-          nrarfcn = nativeCellInfo?['nrarfcn'] as int?;
-
-          final bandsList = nativeCellInfo?['bands'] as List?;
-          nrBand = getNrBand(nrarfcn, bandsList);
-          nrBandwidth = nativeCellInfo?['nrBandwidth'] as int?;
-          nrBwp = nativeCellInfo?['nrBwp'] as int?;
-
-          ssRsrp = nativeCellInfo?['ssRsrp'] as int?;
-          ssRsrq = nativeCellInfo?['ssRsrq'] as int?;
-          ssSinr = nativeCellInfo?['ssSinr'] as int?;
-          csiRsrp = nativeCellInfo?['csiRsrp'] as int?;
-          csiRsrq = nativeCellInfo?['csiRsrq'] as int?;
-          csiSinr = nativeCellInfo?['csiSinr'] as int?;
-          asu5g = nativeCellInfo?['asuLevel'] as int?;
-          activeRsrp = ssRsrp ?? csiRsrp;
-
-          final cqiList = nativeCellInfo?['cqiReport'] as List?;
-          if (cqiList != null && cqiList.isNotEmpty) {
-            nrCqi = cqiList.first as int?;
-          }
-          nrCqiTableIndex = nativeCellInfo?['cqiTableIndex'] as int?;
-        } else if (tech == '4G') {
-          activeCellId = nativeCellInfo?['ci']?.toString();
-          ci4g = nativeCellInfo?['ci'] as int?;
-          pci4g = nativeCellInfo?['pci'] as int?;
-          tac4g = nativeCellInfo?['tac'] as int?;
-          earfcn4g = nativeCellInfo?['earfcn'] as int?;
-          lteBand = getLteBand(earfcn4g);
-
-          final rawBw = nativeCellInfo?['bandwidth'] as int?;
-          lteBandwidth = rawBw != null ? (rawBw / 1000).round() : null;
-
-          rsrp4g = nativeCellInfo?['rsrp'] as int?;
-          rsrq4g = nativeCellInfo?['rsrq'] as int?;
-          rssi4g = nativeCellInfo?['rssi'] as int?;
-          rssnr4g = nativeCellInfo?['rssnr'] as int?;
-          asu4g = nativeCellInfo?['asuLevel'] as int?;
-          timingAdvance = nativeCellInfo?['timingAdvance'] as int?;
-          lteCqi = nativeCellInfo?['cqi'] as int?;
-          activeRsrp = rsrp4g;
-          activeCellId ??= ci4g?.toString();
-        } else if (tech == '3G') {
-          activeCellId =
-              nativeCellInfo?['ucid']?.toString() ??
-              nativeCellInfo?['cellId']?.toString();
-          ucid3g = nativeCellInfo?['ucid'] as int?;
-          psc3g = nativeCellInfo?['psc'] as int?;
-          lac3g = nativeCellInfo?['lac'] as int?;
-          uarfcn3g = nativeCellInfo?['uarfcn'] as int?;
-
-          rscp3g = nativeCellInfo?['rscp'] as int?;
-          ecNo3g = nativeCellInfo?['ecNo'] as int?;
-          asu3g = nativeCellInfo?['asuLevel'] as int?;
-          activeRsrp = rscp3g;
-          activeCellId ??= ucid3g?.toString();
-        } else if (tech == '2G') {
-          activeCellId =
-              nativeCellInfo?['cid']?.toString() ??
-              nativeCellInfo?['cellId']?.toString();
-          cid2g = nativeCellInfo?['cid'] as int?;
-          bsic2g = nativeCellInfo?['bsic'] as int?;
-          lac2g = nativeCellInfo?['lac'] as int?;
-          arfcn2g = nativeCellInfo?['arfcn'] as int?;
-
-          rssi2g = nativeCellInfo?['rssi'] as int?;
-          final ber = nativeCellInfo?['bitErrorRate'] as int?;
-          rxQual2g = ber;
-          asu2g = nativeCellInfo?['asuLevel'] as int?;
-          activeRsrp = rssi2g;
-          activeCellId ??= cid2g?.toString();
-        }
-      }
-
-      // 4. Calculate Derived KPIs
-      final double? dist = calculateDistance(timingAdvance);
-      final double? domMargin = calculateDominanceMargin(
-        activeRsrp,
-        neighbors,
-        tech,
-      );
-      final int ppiVal = calculatePpi(activeRsrp, neighbors, tech);
-      final String ppiStateStr = ppiVal >= 4 ? 'Polluted' : 'Clean';
-      final int pingPong = await calculatePingPongIndex(activeCellId);
-
-      double? asymmetry;
-      if (tech == '4G') {
-        asymmetry = calculateRfAsymmetry(rsrp4g, rssi4g);
-      }
-
-      // 6. Build Model using active runtime performance statistics
-      final telemetry = TelemetryModel(
-        timestamp: DateTime.now().toIso8601String(),
-        latitude: lat,
-        longitude: lng,
-        accuracy: accuracy,
-        speed: gpsSpeed,
-        carrierName: carrier,
-        networkType: networkTypeStr,
-        technology: tech,
-        mcc: mcc,
-        mnc: mnc,
-        dataState: dataState,
-        registeredState: regState,
-        imei: imei,
-
-        // 5G NR
-        ssRsrp: ssRsrp,
-        ssRsrq: ssRsrq,
-        ssSinr: ssSinr,
-        csiRsrp: csiRsrp,
-        csiRsrq: csiRsrq,
-        csiSinr: csiSinr,
-        nci: nci,
-        pci5g: pci5g,
-        tac5g: tac5g,
-        nrarfcn: nrarfcn,
-        nrBand: nrBand,
-        nrBandwidth: nrBandwidth,
-        nrBwp: nrBwp,
-        asu5g: asu5g,
-        nrCqi: nrCqi,
-        nrCqiTableIndex: nrCqiTableIndex,
-
-        // 4G LTE
-        rsrp4g: rsrp4g,
-        rsrq4g: rsrq4g,
-        rssi4g: rssi4g,
-        rssnr4g: rssnr4g,
-        lteCqi: lteCqi,
-        timingAdvance: timingAdvance,
-        ci4g: ci4g,
-        pci4g: pci4g,
-        tac4g: tac4g,
-        earfcn4g: earfcn4g,
-        lteBand: lteBand,
-        lteBandwidth: lteBandwidth,
-        asu4g: asu4g,
-        calculatedDistance: dist,
-
-        // 3G WCDMA
-        rscp3g: rscp3g,
-        ecNo3g: ecNo3g,
-        lac3g: lac3g,
-        ucid3g: ucid3g,
-        psc3g: psc3g,
-        uarfcn3g: uarfcn3g,
-        asu3g: asu3g,
-
-        // 2G GSM
-        rssi2g: rssi2g,
-        rxQual2g: rxQual2g,
-        lac2g: lac2g,
-        cid2g: cid2g,
-        bsic2g: bsic2g,
-        arfcn2g: arfcn2g,
-        asu2g: asu2g,
-
-        neighborCells: neighbors,
-        ppi: ppiVal,
-        ppiState: ppiStateStr,
-        dominanceMargin: domMargin,
-        pingPongIndex: pingPong,
-        rfAsymmetryIndex: asymmetry,
-
-        // Populated KPIs matching schema constraints
-        downloadSpeed: speedResult?.downloadSpeed,
-        uploadSpeed: speedResult?.uploadSpeed,
-        ping: speedResult?.ping,
-        jitter: speedResult?.jitter,
-        packetLoss: speedResult?.packetLoss,
-        deviceModel: model,
-        androidVersion: osVersion,
-        synced: false,
-      );
-
-      // Save database log
-      final insertedId = await DatabaseHelper.instance.insertLog(telemetry);
-
-      // Auto Sync if connected
-      bool syncSuccessful = false;
-      if (networkTypeStr != 'None') {
-        syncSuccessful = await performSync();
-      }
-
-      final unsyncedCount = await DatabaseHelper.instance.getUnsyncedCount();
-
-      // Emit parameters map to dashboard isolate
-      final Map<String, dynamic> updateData = telemetry.toDbMap();
-      updateData['id'] = insertedId;
-      updateData['unsynced_count'] = unsyncedCount;
-      updateData['sync_success'] = syncSuccessful;
-
-      service.invoke('update', updateData);
-
-      // Update Foreground persistent notification info
-      if (service is AndroidServiceInstance) {
-        String networkSummary = networkTypeStr == 'Cellular'
-            ? '$tech ($carrier)'
-            : networkTypeStr;
-        service.setForegroundNotificationInfo(
-          title: 'SpeedCheck Telemetry Active',
-          content: 'Net: $networkSummary | Unsynced: $unsyncedCount',
-        );
-      }
-    } catch (e) {
-      print('Background collect loop error: $e');
+  // Listen to configuration updates from the main UI controller
+  service.on('updateSettings').listen((event) async {
+    final updatedFreqStr = await dbHelper.getSetting('record_frequency', '10');
+    final updatedFreqSeconds = int.tryParse(updatedFreqStr) ?? 10;
+    if (updatedFreqSeconds != freqSeconds) {
+      freqSeconds = updatedFreqSeconds;
+      startTimer(freqSeconds);
     }
   });
 }
