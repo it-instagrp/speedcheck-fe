@@ -62,7 +62,7 @@ class SpeedCheckApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return ToastificationWrapper(
       child: GetMaterialApp(
-        title: 'SpeedCheck',
+        title: 'NetDrishti',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           useMaterial3: true,
